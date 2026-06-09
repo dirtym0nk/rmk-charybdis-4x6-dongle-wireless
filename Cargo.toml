@@ -87,3 +87,8 @@ debug = true            # no overhead for bare-metal
 opt-level = "z"         # optimize for binary size
 overflow-checks = false
 lto = "fat"
+
+# Use a locally patched copy of RMK to add layer-aware trackball scrolling
+# (see rmk-patched/src/input_device/pmw3610.rs)
+[patch.crates-io]
+rmk = { path = "rmk-patched" }

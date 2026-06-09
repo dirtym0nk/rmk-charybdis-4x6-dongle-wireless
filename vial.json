@@ -42,6 +42,16 @@
             "name": "SWITCH",
             "title": "Switch default output mode between USB/BLE",
             "shortName": "Switch\nOutput"
+        },
+        {
+            "name": "CLR_PEER",
+            "title": "Clear split peer info (hold 5s)",
+            "shortName": "Clear\nPeer"
+        },
+        {
+            "name": "SCROLL",
+            "title": "Hold to scroll with the trackball",
+            "shortName": "Scroll"
         }
     ],
     "layouts": {
