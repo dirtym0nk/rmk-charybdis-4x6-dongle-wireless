@@ -57,6 +57,9 @@ BT_Next = "User3"
 BT_Prev = "User4"
 BT_Clear = "User5"
 BT_Toggle = "User6" # Toggle between USB and BLE
+# Trackball modes (handled in the patched RMK, emit no HID report themselves)
+SCROLL = "User8" # Hold to scroll with the trackball
+CARET = "User9"  # Hold to move the text caret with the trackball (arrow-key taps)
 
 
 [[layer]] # 0

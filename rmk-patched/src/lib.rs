@@ -31,7 +31,7 @@ use config::RmkConfig;
 #[cfg(feature = "controller")]
 use controller::{PollingController, wpm::WpmController};
 #[cfg(not(feature = "_ble"))]
-use descriptor::{CompositeReport, KeyboardReport};
+use descriptor::{CompositeReportHiRes, KeyboardReport};
 #[cfg(not(any(cortex_m)))]
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex as RawMutex;
 #[cfg(cortex_m)]
@@ -267,7 +267,9 @@ pub async fn run_rmk<
     {
         let mut usb_builder: embassy_usb::Builder<'_, D> = new_usb_builder(usb_driver, rmk_config.device_config);
         let keyboard_reader_writer = add_usb_reader_writer!(&mut usb_builder, KeyboardReport, 1, 8);
-        let mut other_writer = add_usb_writer!(&mut usb_builder, CompositeReport, 9);
+        // Hi-res variant of the composite descriptor: adds the wheel/pan Resolution
+        // Multiplier feature report for hi-res scrolling.
+        let mut other_writer = add_usb_writer!(&mut usb_builder, CompositeReportHiRes, 9);
         #[cfg(feature = "host")]
         let mut host_reader_writer = add_usb_reader_writer!(&mut usb_builder, ViaReport, 32, 32);
 

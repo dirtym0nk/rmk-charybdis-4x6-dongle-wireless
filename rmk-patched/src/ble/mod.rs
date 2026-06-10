@@ -21,7 +21,7 @@ use {
 use {crate::descriptor::ViaReport, crate::host::UsbHostReaderWriter};
 #[cfg(not(feature = "_no_usb"))]
 use {
-    crate::descriptor::{CompositeReport, KeyboardReport},
+    crate::descriptor::{CompositeReportHiRes, KeyboardReport},
     crate::light::UsbLedReader,
     crate::state::get_connection_type,
     crate::usb::UsbKeyboardWriter,
@@ -131,7 +131,9 @@ pub(crate) async fn run_ble<
     let (mut _usb_builder, mut keyboard_reader, mut keyboard_writer, mut other_writer) = {
         let mut usb_builder: embassy_usb::Builder<'_, D> = new_usb_builder(usb_driver, rmk_config.device_config);
         let keyboard_reader_writer = add_usb_reader_writer!(&mut usb_builder, KeyboardReport, 1, 8);
-        let other_writer = add_usb_writer!(&mut usb_builder, CompositeReport, 9);
+        // Hi-res variant of the composite descriptor (USB only): adds the wheel/pan
+        // Resolution Multiplier feature report. The BLE report map keeps CompositeReport.
+        let other_writer = add_usb_writer!(&mut usb_builder, CompositeReportHiRes, 9);
         let (keyboard_reader, keyboard_writer) = keyboard_reader_writer.split();
         (usb_builder, keyboard_reader, keyboard_writer, other_writer)
     };

@@ -17,6 +17,30 @@ use crate::{CONNECTION_STATE, RawMutex};
 
 pub(crate) static USB_REMOTE_WAKEUP: Signal<RawMutex, ()> = Signal::new();
 
+/// Mouse report id (matches `CompositeReportType::Mouse`), used by the hi-res
+/// scrolling resolution multiplier feature report.
+const MOUSE_REPORT_ID: u8 = 0x01;
+
+/// Physical maximum of the Resolution Multiplier in `CompositeReportHiRes`'s descriptor.
+const RESOLUTION_MULTIPLIER_MAX: u8 = 120;
+
+/// Raw multiplier feature bits last written by the host (0 = default / classic scrolling).
+static MULTIPLIER_FEATURE_BITS: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+/// Effective wheel/pan scroll multipliers (1 = classic notches, 120 = hi-res).
+/// Read by the trackball processor to scale emitted wheel/pan deltas. Only a USB
+/// host that supports hi-res scrolling ever raises these via SET_FEATURE; macOS
+/// never does, so it keeps the classic behavior automatically.
+pub(crate) static WHEEL_MULTIPLIER: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(1);
+pub(crate) static PAN_MULTIPLIER: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(1);
+
+fn apply_multiplier_bits(bits: u8) {
+    MULTIPLIER_FEATURE_BITS.store(bits, Ordering::Relaxed);
+    let m = |field_bits: u8| if field_bits != 0 { RESOLUTION_MULTIPLIER_MAX } else { 1 };
+    WHEEL_MULTIPLIER.store(m(bits & 0b0011), Ordering::Relaxed);
+    PAN_MULTIPLIER.store(m(bits & 0b1100), Ordering::Relaxed);
+}
+
 /// USB state
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -222,8 +246,28 @@ pub(crate) struct UsbRequestHandler {}
 
 impl RequestHandler for UsbRequestHandler {
     fn set_report(&mut self, id: ReportId, data: &[u8]) -> OutResponse {
+        if let ReportId::Feature(MOUSE_REPORT_ID) = id {
+            // Resolution multiplier write (hi-res scrolling opt-in). Linux prefixes
+            // the report id in the control data for numbered reports, so parse by length.
+            let bits = if data.len() >= 2 { data[1] } else { data.first().copied().unwrap_or(0) };
+            apply_multiplier_bits(bits);
+            info!("Resolution multiplier feature set: {:#x}", bits);
+            return OutResponse::Accepted;
+        }
         info!("Set report for {:?}: {:?}", id, data);
         OutResponse::Accepted
+    }
+
+    fn get_report(&mut self, id: ReportId, buf: &mut [u8]) -> Option<usize> {
+        if let ReportId::Feature(MOUSE_REPORT_ID) = id
+            && buf.len() >= 2
+        {
+            // Numbered reports are returned id-prefixed.
+            buf[0] = MOUSE_REPORT_ID;
+            buf[1] = MULTIPLIER_FEATURE_BITS.load(Ordering::Relaxed);
+            return Some(2);
+        }
+        None
     }
 }
 
@@ -245,6 +289,8 @@ impl Handler for UsbDeviceHandler {
             USB_ENABLED.signal(());
         } else {
             info!("Device disabled");
+            // A re-enumerating host must opt back in to hi-res scrolling.
+            apply_multiplier_bits(0);
             if USB_ENABLED.signaled() {
                 USB_ENABLED.reset();
                 USB_SUSPENDED.signal(());
@@ -254,6 +300,8 @@ impl Handler for UsbDeviceHandler {
 
     fn reset(&mut self) {
         info!("Bus reset, the Vbus current limit is 100mA");
+        // A re-enumerating host must opt back in to hi-res scrolling.
+        apply_multiplier_bits(0);
     }
 
     fn addressed(&mut self, addr: u8) {

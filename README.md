@@ -23,22 +23,60 @@ What's added:
   release to go back to moving the cursor. Scrolling is suppressed while a mouse
   button is held (so dragging always wins). The scroll key is `User8`; place it from
   the **User** tab in Vial (a `SCROLL` keycode is exposed in `vial.json`).
+- **Hi-res scrolling (USB)** — the USB HID descriptor advertises a wheel/pan
+  *Resolution Multiplier* (×120, the same mechanism Logitech mice use). Hosts that
+  support it (Linux, Windows) opt in automatically and get smooth, pixel-precise
+  scrolling; hosts that ignore it (macOS) and BLE hosts keep the classic one-notch
+  behavior — nothing to configure on either side.
+- **Caret mode on a dedicated key** — hold the **CARET** key (`User9`, exposed in
+  Vial's **User** tab) and move the ball to move the text caret via arrow-key taps
+  (like ZMK's caret behavior). Taps go through the normal keyboard state, so holding
+  `Shift` extends the selection and other held keys stay pressed. The movement axis
+  is locked while you move, so slight vertical drift doesn't jump lines mid-word; to
+  change direction, pause briefly (~200 ms) or move firmly across. Priority when
+  several modes apply: mouse-button drag > SCROLL > CARET > cursor movement.
 
 ### Patched RMK
 
 The trackball scroll behaviour is not configurable in upstream RMK, so a local copy
 of rmk 0.8.2 lives in [`rmk-patched/`](rmk-patched/) and is wired in via
-`[patch.crates-io]` in [`Cargo.toml`](Cargo.toml). The only edits are in
-`rmk-patched/src/input_device/pmw3610.rs` (layer-/key-aware scroll + accumulator) and
-`rmk-patched/src/keyboard.rs` (shared `MOUSE_BUTTONS_STATE` / `SCROLL_KEY_HELD` flags).
+`[patch.crates-io]` in [`Cargo.toml`](Cargo.toml). The edits are in:
+
+- `rmk-patched/src/input_device/pmw3610.rs` — key-aware scroll/caret modes with
+  delta accumulators and hi-res-aware scroll math.
+- `rmk-patched/src/keyboard.rs` — shared `MOUSE_BUTTONS_STATE` / `SCROLL_KEY_HELD` /
+  `CARET_KEY_HELD` flags and the injected-tap path (caret taps that preserve held
+  modifiers).
+- `rmk-patched/src/channel.rs` — `INJECTED_TAP_CHANNEL` (input processors → keyboard
+  task).
+- `rmk-patched/src/descriptor.rs` — `CompositeReportHiRes`, a hand-written USB
+  descriptor with the Resolution Multiplier feature report (the BLE report map keeps
+  the stock descriptor).
+- `rmk-patched/src/usb/mod.rs` — GET/SET_FEATURE handling for the multiplier and the
+  `WHEEL_MULTIPLIER`/`PAN_MULTIPLIER` state (reset on USB re-enumeration).
+- `rmk-patched/src/ble/mod.rs`, `rmk-patched/src/lib.rs` — the USB writer uses the
+  hi-res descriptor.
+
+Battery note: all of this runs on the USB-powered dongle; the halves' firmware,
+sensor polling and BLE split traffic are unchanged.
 
 ### Tuning
 
 In `rmk-patched/src/input_device/pmw3610.rs`:
 
 - `SCROLL_DIVISOR` — scroll speed (higher = slower).
+- `CARET_DIVISOR` — caret speed (higher = slower).
+- `CARET_TAP_MIN_INTERVAL` — minimum time between caret arrow taps.
+- `CARET_AXIS_SWITCH_THRESHOLD` — how much perpendicular movement is needed to change
+  the caret direction mid-movement (higher = stickier axis lock).
+- `CARET_AXIS_UNLOCK_TIMEOUT` — pause after which the axis lock is released.
 - Vertical direction — the sign on `scroll_acc_v` (`-= y` vs `+= y`); horizontal is
   the sign on `scroll_acc_h`.
+
+In `rmk-patched/src/usb/mod.rs`:
+
+- `RESOLUTION_MULTIPLIER_MAX` — hi-res scroll granularity (must match the Physical
+  Maximum in the descriptor; 120 is the conventional value).
 
 After editing, rebuild with `cargo make uf2` and reflash `chary-dongle.uf2`.
 

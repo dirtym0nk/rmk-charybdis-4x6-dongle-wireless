@@ -5,12 +5,13 @@
 
 use core::cell::RefCell;
 
-use embassy_time::{Duration, Timer};
+use embassy_time::{Duration, Instant, Timer};
 use embedded_hal::digital::{InputPin, OutputPin};
 use embedded_hal_async::spi::SpiBus;
+use rmk_types::keycode::KeyCode;
 use usbd_hid::descriptor::MouseReport;
 
-use crate::channel::KEYBOARD_REPORT_CHANNEL;
+use crate::channel::{INJECTED_TAP_CHANNEL, KEYBOARD_REPORT_CHANNEL};
 pub use crate::driver::bitbang_spi::{BitBangError, BitBangSpiBus};
 use crate::event::{Axis, AxisEvent, AxisValType, Event};
 use crate::hid::Report;
@@ -577,6 +578,22 @@ where
 /// Accumulated trackball counts per scroll tick. Lower = faster/more sensitive, higher = slower.
 const SCROLL_DIVISOR: i32 = 48;
 
+/// Accumulated trackball counts per caret arrow tap. Lower = faster caret, higher = slower.
+const CARET_DIVISOR: i32 = 64;
+
+/// Minimum time between caret arrow taps, so a fast flick becomes a steady stream
+/// of taps instead of flooding the host.
+const CARET_TAP_MIN_INTERVAL: Duration = Duration::from_millis(15);
+
+/// Accumulated counts on the perpendicular axis needed to switch the caret direction
+/// while the axis lock is engaged. Higher = harder to drift onto another line while
+/// moving horizontally (and vice versa).
+const CARET_AXIS_SWITCH_THRESHOLD: i32 = 3 * CARET_DIVISOR;
+
+/// Pause without trackball motion after which the caret axis lock is released, so a
+/// deliberate direction change after a short stop feels immediate.
+const CARET_AXIS_UNLOCK_TIMEOUT: Duration = Duration::from_millis(200);
+
 pub struct Pmw3610Processor<'a, const ROW: usize, const COL: usize, const NUM_LAYER: usize, const NUM_ENCODER: usize> {
     /// Reference to the keymap
     keymap: &'a RefCell<KeyMap<'a, ROW, COL, NUM_LAYER, NUM_ENCODER>>,
@@ -584,6 +601,20 @@ pub struct Pmw3610Processor<'a, const ROW: usize, const COL: usize, const NUM_LA
     scroll_acc_h: i32,
     /// Accumulated vertical movement waiting to become a scroll tick (wheel).
     scroll_acc_v: i32,
+    /// (wheel, pan) multipliers the scroll accumulators are currently scaled by;
+    /// when the host changes them the stale remainders are dropped.
+    last_multipliers: (i32, i32),
+    /// Accumulated horizontal movement waiting to become a caret arrow tap.
+    caret_acc_x: i32,
+    /// Accumulated vertical movement waiting to become a caret arrow tap.
+    caret_acc_y: i32,
+    /// When the last caret arrow tap was emitted (rate limiting).
+    last_caret_tap: Instant,
+    /// Axis the caret is currently locked to (true = horizontal); None = unlocked.
+    /// Prevents small perpendicular drift from jumping lines mid-movement.
+    caret_axis_horizontal: Option<bool>,
+    /// When the trackball last moved in caret mode (axis lock timeout).
+    last_caret_motion: Instant,
 }
 
 impl<'a, const ROW: usize, const COL: usize, const NUM_LAYER: usize, const NUM_ENCODER: usize>
@@ -595,7 +626,28 @@ impl<'a, const ROW: usize, const COL: usize, const NUM_LAYER: usize, const NUM_E
             keymap,
             scroll_acc_h: 0,
             scroll_acc_v: 0,
+            last_multipliers: (1, 1),
+            caret_acc_x: 0,
+            caret_acc_y: 0,
+            last_caret_tap: Instant::now(),
+            caret_axis_horizontal: None,
+            last_caret_motion: Instant::now(),
         }
+    }
+
+    /// Current (wheel, pan) resolution multipliers. 1 = classic notches; a USB host
+    /// that supports hi-res scrolling raises them to 120 via a HID feature report.
+    /// Forced to 1 while the host connection is not USB: the multiplier is only
+    /// advertised in the USB descriptor, so a BLE host must get classic notches.
+    fn resolution_multipliers(&self) -> (i32, i32) {
+        #[cfg(not(feature = "_no_usb"))]
+        if crate::state::get_connection_type() == crate::state::ConnectionType::Usb {
+            return (
+                crate::usb::WHEEL_MULTIPLIER.load(core::sync::atomic::Ordering::Relaxed) as i32,
+                crate::usb::PAN_MULTIPLIER.load(core::sync::atomic::Ordering::Relaxed) as i32,
+            );
+        }
+        (1, 1)
     }
 
     async fn generate_report(&self, x: i16, y: i16) {
@@ -642,22 +694,40 @@ impl<'a, const ROW: usize, const COL: usize, const NUM_LAYER: usize, const NUM_E
                     }
                 }
 
-                // Scroll only while the dedicated scroll key (User8) is held AND no mouse
-                // button is held; while a button is held, move the cursor instead so dragging works.
+                // Mode priority: held mouse buttons (drag) > scroll > caret > cursor movement.
+                // While a button is held, always move the cursor so dragging works.
                 let buttons_held =
                     crate::keyboard::MOUSE_BUTTONS_STATE.load(core::sync::atomic::Ordering::Relaxed) != 0;
                 let scroll_held =
                     crate::keyboard::SCROLL_KEY_HELD.load(core::sync::atomic::Ordering::Relaxed);
+                let caret_held =
+                    crate::keyboard::CARET_KEY_HELD.load(core::sync::atomic::Ordering::Relaxed);
                 if scroll_held && !buttons_held {
+                    self.caret_acc_x = 0;
+                    self.caret_acc_y = 0;
+                    self.caret_axis_horizontal = None;
                     // Accumulate small per-event deltas so slow motion still scrolls (no dead
                     // zone). Emit at most one wheel notch per report and bound the accumulator
                     // so a fast flick is spread into steady single ticks instead of big skips.
-                    self.scroll_acc_v -= y as i32;
-                    self.scroll_acc_h += x as i32;
-                    self.scroll_acc_v = self.scroll_acc_v.clamp(-2 * SCROLL_DIVISOR, 2 * SCROLL_DIVISOR);
-                    self.scroll_acc_h = self.scroll_acc_h.clamp(-2 * SCROLL_DIVISOR, 2 * SCROLL_DIVISOR);
-                    let wheel = (self.scroll_acc_v / SCROLL_DIVISOR).clamp(-1, 1);
-                    let pan = (self.scroll_acc_h / SCROLL_DIVISOR).clamp(-1, 1);
+                    //
+                    // Hi-res: a host that opted in via the Resolution Multiplier divides wheel
+                    // values by m, so one detent = m units. Accumulating sensor counts scaled
+                    // by m keeps the math exact (no remainder loss) and reduces bit-for-bit to
+                    // the classic behavior when m == 1.
+                    let (m_w, m_p) = self.resolution_multipliers();
+                    if (m_w, m_p) != self.last_multipliers {
+                        // Units changed; old remainders are meaningless.
+                        self.scroll_acc_v = 0;
+                        self.scroll_acc_h = 0;
+                        self.last_multipliers = (m_w, m_p);
+                    }
+                    self.scroll_acc_v -= (y as i32) * m_w;
+                    self.scroll_acc_h += (x as i32) * m_p;
+                    self.scroll_acc_v = self.scroll_acc_v.clamp(-2 * SCROLL_DIVISOR * m_w, 2 * SCROLL_DIVISOR * m_w);
+                    self.scroll_acc_h = self.scroll_acc_h.clamp(-2 * SCROLL_DIVISOR * m_p, 2 * SCROLL_DIVISOR * m_p);
+                    // At most one notch (m units) per report; m <= 120 fits in the i8 report field.
+                    let wheel = (self.scroll_acc_v / SCROLL_DIVISOR).clamp(-m_w, m_w);
+                    let pan = (self.scroll_acc_h / SCROLL_DIVISOR).clamp(-m_p, m_p);
                     self.scroll_acc_v -= wheel * SCROLL_DIVISOR;
                     self.scroll_acc_h -= pan * SCROLL_DIVISOR;
                     if wheel != 0 || pan != 0 {
@@ -667,10 +737,89 @@ impl<'a, const ROW: usize, const COL: usize, const NUM_LAYER: usize, const NUM_E
                         )
                         .await;
                     }
+                } else if caret_held && !buttons_held {
+                    // Caret mode: turn trackball movement into arrow-key taps so the text
+                    // caret follows the ball. Taps are injected into the keyboard task, so
+                    // held modifiers apply (e.g. Shift extends the selection).
+                    self.scroll_acc_v = 0;
+                    self.scroll_acc_h = 0;
+                    let now = Instant::now();
+                    // Axis lock: while moving along one axis, small drift on the other is
+                    // absorbed so the caret doesn't jump lines mid-movement. A short pause
+                    // releases the lock so a deliberate direction change feels immediate.
+                    if now.duration_since(self.last_caret_motion) >= CARET_AXIS_UNLOCK_TIMEOUT {
+                        self.caret_axis_horizontal = None;
+                        self.caret_acc_x = 0;
+                        self.caret_acc_y = 0;
+                    }
+                    self.last_caret_motion = now;
+                    self.caret_acc_x += x as i32;
+                    self.caret_acc_y += y as i32;
+                    // Locked axis (or both while unlocked): bound the backlog to 2 taps,
+                    // same de-jerk idea as scroll. The perpendicular axis is allowed to
+                    // accumulate up to the switch threshold instead.
+                    let (clamp_x, clamp_y) = match self.caret_axis_horizontal {
+                        Some(true) => (2 * CARET_DIVISOR, CARET_AXIS_SWITCH_THRESHOLD),
+                        Some(false) => (CARET_AXIS_SWITCH_THRESHOLD, 2 * CARET_DIVISOR),
+                        None => (2 * CARET_DIVISOR, 2 * CARET_DIVISOR),
+                    };
+                    self.caret_acc_x = self.caret_acc_x.clamp(-clamp_x, clamp_x);
+                    self.caret_acc_y = self.caret_acc_y.clamp(-clamp_y, clamp_y);
+                    // Pick the axis: locked one, switching only on a strong perpendicular
+                    // move; otherwise the dominant accumulator wins (x on a tie).
+                    let horizontal = match self.caret_axis_horizontal {
+                        Some(locked_horizontal) => {
+                            let perp = if locked_horizontal { self.caret_acc_y } else { self.caret_acc_x };
+                            if perp.abs() >= CARET_AXIS_SWITCH_THRESHOLD {
+                                // Deliberate perpendicular movement: switch the lock and
+                                // drop the old axis remainder.
+                                if locked_horizontal {
+                                    self.caret_acc_x = 0;
+                                } else {
+                                    self.caret_acc_y = 0;
+                                }
+                                self.caret_axis_horizontal = Some(!locked_horizontal);
+                                !locked_horizontal
+                            } else {
+                                locked_horizontal
+                            }
+                        }
+                        None => self.caret_acc_x.abs() >= self.caret_acc_y.abs(),
+                    };
+                    if now.duration_since(self.last_caret_tap) >= CARET_TAP_MIN_INTERVAL {
+                        // One tap per interval.
+                        let acc = if horizontal { self.caret_acc_x } else { self.caret_acc_y };
+                        let step = (acc / CARET_DIVISOR).clamp(-1, 1);
+                        if step != 0 {
+                            let key = match (horizontal, step > 0) {
+                                (true, true) => KeyCode::Right,
+                                (true, false) => KeyCode::Left,
+                                (false, true) => KeyCode::Down, // mouse +y = down
+                                (false, false) => KeyCode::Up,
+                            };
+                            // Non-blocking: only consume the accumulator if the tap was queued.
+                            if INJECTED_TAP_CHANNEL.try_send(key).is_ok() {
+                                if horizontal {
+                                    self.caret_acc_x -= step * CARET_DIVISOR;
+                                    // Decay perpendicular drift so it never builds up to the
+                                    // switch threshold during a long move along this axis.
+                                    self.caret_acc_y /= 2;
+                                } else {
+                                    self.caret_acc_y -= step * CARET_DIVISOR;
+                                    self.caret_acc_x /= 2;
+                                }
+                                self.caret_axis_horizontal = Some(horizontal);
+                                self.last_caret_tap = now;
+                            }
+                        }
+                    }
                 } else {
                     // Not scrolling: drop any stale remainder so it can't leak into the next gesture.
                     self.scroll_acc_v = 0;
                     self.scroll_acc_h = 0;
+                    self.caret_acc_x = 0;
+                    self.caret_acc_y = 0;
+                    self.caret_axis_horizontal = None;
                     self.generate_report(x, y).await;
                 }
                 ProcessResult::Stop

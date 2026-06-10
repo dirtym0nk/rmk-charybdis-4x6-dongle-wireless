@@ -60,6 +60,10 @@ pub(crate) static MOUSE_BUTTONS_STATE: core::sync::atomic::AtomicU8 = core::sync
 /// movement into scrolling while this is true.
 pub(crate) static SCROLL_KEY_HELD: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
+/// Set while the dedicated caret key (User9) is held. The trackball processor turns
+/// movement into arrow-key taps (text caret movement) while this is true.
+pub(crate) static CARET_KEY_HELD: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
 /// State machine for one shot keys
 #[derive(Default)]
 enum OneShotState<T> {
@@ -175,10 +179,17 @@ impl<const ROW: usize, const COL: usize, const NUM_LAYER: usize, const NUM_ENCOD
                 // Process buffered held key
                 self.process_buffered_key(key).await
             } else {
-                // No buffered tap-hold event, wait for new key
-                let event = KEY_EVENT_CHANNEL.receive().await;
-                // Process the key event
-                self.process_inner(event).await
+                // No buffered tap-hold event, wait for a new key or an injected tap
+                // (e.g. trackball caret mode arrow taps).
+                match select(
+                    KEY_EVENT_CHANNEL.receive(),
+                    crate::channel::INJECTED_TAP_CHANNEL.receive(),
+                )
+                .await
+                {
+                    Either::First(event) => self.process_inner(event).await,
+                    Either::Second(key) => self.tap_injected_key(key).await,
+                }
             };
         }
     }
@@ -1777,6 +1788,11 @@ impl<'a, const ROW: usize, const COL: usize, const NUM_LAYER: usize, const NUM_E
             SCROLL_KEY_HELD.store(event.pressed, core::sync::atomic::Ordering::Relaxed);
             return;
         }
+        // Dedicated caret key: hold to move the text caret with the trackball. Emits no HID report.
+        if key == KeyCode::User9 {
+            CARET_KEY_HELD.store(event.pressed, core::sync::atomic::Ordering::Relaxed);
+            return;
+        }
         #[cfg(feature = "_ble")]
         {
             use crate::NUM_BLE_PROFILE;
@@ -1925,6 +1941,18 @@ impl<'a, const ROW: usize, const COL: usize, const NUM_LAYER: usize, const NUM_E
         } else {
             error!("Macro not found");
         }
+    }
+
+    /// Tap a key injected by an input processor (e.g. trackball caret mode). The tap goes
+    /// through the normal held-key/modifier state, so held modifiers apply to it (e.g.
+    /// Shift + caret movement extends the text selection) and held keys stay pressed.
+    async fn tap_injected_key(&mut self, key: KeyCode) {
+        // Synthetic out-of-matrix position; only used for registered_keys slot bookkeeping
+        // and released synchronously below, so it can't collide with real key events.
+        self.register_key(key, KeyboardEvent::key(u8::MAX, u8::MAX, true));
+        self.send_keyboard_report_with_resolved_modifiers(true).await;
+        self.unregister_key(key, KeyboardEvent::key(u8::MAX, u8::MAX, false));
+        self.send_keyboard_report_with_resolved_modifiers(false).await;
     }
 
     pub(crate) async fn send_keyboard_report_with_resolved_modifiers(&mut self, pressed: bool) {
