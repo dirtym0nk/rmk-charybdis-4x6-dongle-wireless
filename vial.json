@@ -52,6 +52,11 @@
             "name": "SCROLL",
             "title": "Hold to scroll with the trackball",
             "shortName": "Scroll"
+        },
+        {
+            "name": "CARET",
+            "title": "Hold to move the text caret with the trackball",
+            "shortName": "Caret"
         }
     ],
     "layouts": {

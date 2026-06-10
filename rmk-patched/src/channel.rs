@@ -62,6 +62,9 @@ pub static KEY_EVENT_CHANNEL: Channel<RawMutex, KeyboardEvent, EVENT_CHANNEL_SIZ
 pub static EVENT_CHANNEL: Channel<RawMutex, Event, EVENT_CHANNEL_SIZE> = Channel::new();
 /// Channel for keyboard report from input processors to hid writer/reader
 pub static KEYBOARD_REPORT_CHANNEL: Channel<RawMutex, Report, REPORT_CHANNEL_SIZE> = Channel::new();
+/// Key taps injected by input processors (e.g. trackball caret mode), consumed by the
+/// keyboard task so they go through the normal report state (held modifiers/keys preserved).
+pub static INJECTED_TAP_CHANNEL: Channel<RawMutex, rmk_types::keycode::KeyCode, 4> = Channel::new();
 /// Channel for controller events
 #[cfg(feature = "controller")]
 pub static CONTROLLER_CHANNEL: PubSubChannel<

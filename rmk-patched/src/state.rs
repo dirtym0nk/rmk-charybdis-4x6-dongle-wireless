@@ -8,6 +8,7 @@ pub(crate) static CONNECTION_TYPE: AtomicU8 = AtomicU8::new(0);
 pub(crate) static CONNECTION_STATE: AtomicBool = AtomicBool::new(false);
 
 /// Current default connection type
+#[derive(PartialEq, Eq, Clone, Copy)]
 pub enum ConnectionType {
     Usb = 0,
     Ble = 1,
