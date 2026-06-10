@@ -575,7 +575,7 @@ where
 
 /// PMW3610 Processor that converts motion events to mouse reports
 /// Accumulated trackball counts per scroll tick. Lower = faster/more sensitive, higher = slower.
-const SCROLL_DIVISOR: i32 = 24;
+const SCROLL_DIVISOR: i32 = 48;
 
 pub struct Pmw3610Processor<'a, const ROW: usize, const COL: usize, const NUM_LAYER: usize, const NUM_ENCODER: usize> {
     /// Reference to the keymap
@@ -650,17 +650,20 @@ impl<'a, const ROW: usize, const COL: usize, const NUM_LAYER: usize, const NUM_E
                     crate::keyboard::SCROLL_KEY_HELD.load(core::sync::atomic::Ordering::Relaxed);
                 if scroll_held && !buttons_held {
                     // Accumulate small per-event deltas so slow motion still scrolls (no dead
-                    // zone) and fast motion stays smooth; keep the remainder for the next event.
+                    // zone). Emit at most one wheel notch per report and bound the accumulator
+                    // so a fast flick is spread into steady single ticks instead of big skips.
                     self.scroll_acc_v -= y as i32;
                     self.scroll_acc_h += x as i32;
-                    let wheel = self.scroll_acc_v / SCROLL_DIVISOR;
-                    let pan = self.scroll_acc_h / SCROLL_DIVISOR;
+                    self.scroll_acc_v = self.scroll_acc_v.clamp(-2 * SCROLL_DIVISOR, 2 * SCROLL_DIVISOR);
+                    self.scroll_acc_h = self.scroll_acc_h.clamp(-2 * SCROLL_DIVISOR, 2 * SCROLL_DIVISOR);
+                    let wheel = (self.scroll_acc_v / SCROLL_DIVISOR).clamp(-1, 1);
+                    let pan = (self.scroll_acc_h / SCROLL_DIVISOR).clamp(-1, 1);
                     self.scroll_acc_v -= wheel * SCROLL_DIVISOR;
                     self.scroll_acc_h -= pan * SCROLL_DIVISOR;
                     if wheel != 0 || pan != 0 {
                         self.generate_scroll_report(
-                            wheel.clamp(i8::MIN as i32, i8::MAX as i32) as i8,
-                            pan.clamp(i8::MIN as i32, i8::MAX as i32) as i8,
+                            wheel as i8,
+                            pan as i8,
                         )
                         .await;
                     }
